@@ -1,20 +1,34 @@
-import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import localFont from "next/font/local";
+import { RegisterServiceWorker } from "@/components/RegisterServiceWorker";
+import { BRAND } from "@/components/pdfapp/brand";
+import { withBase } from "@/lib/base";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
+// Inter (SIL Open Font License), bundled locally so the app works offline.
+const inter = localFont({
+  variable: "--font-inter",
+  display: "swap",
+  src: [
+    { path: "../fonts/inter-latin-wght-normal.woff2", weight: "100 900", style: "normal" },
+    { path: "../fonts/inter-latin-ext-wght-normal.woff2", weight: "100 900", style: "normal" },
+  ],
 });
 
 export const metadata: Metadata = {
-  title: "Website Clone",
-  description: "Pixel-perfect website clone",
+  title: { default: `${BRAND.name} – ${BRAND.tagline}`, template: `%s – ${BRAND.name}` },
+  description: BRAND.description,
+  applicationName: BRAND.name,
+  icons: {
+    icon: [{ url: withBase("/icons/icon-192.png"), sizes: "192x192", type: "image/png" }],
+    apple: withBase("/icons/apple-touch-icon.png"),
+  },
+  manifest: withBase("/manifest.webmanifest"),
+  appleWebApp: { capable: true, title: BRAND.name, statusBarStyle: "default" },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#4f46e5",
 };
 
 export default function RootLayout({
@@ -23,11 +37,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col">{children}</body>
+    <html lang="de" className={`${inter.variable} h-full`}>
+      <body className="min-h-full">
+        {children}
+        <RegisterServiceWorker />
+      </body>
     </html>
   );
 }

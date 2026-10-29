@@ -88,21 +88,10 @@ ENV HOSTNAME="0.0.0.0"
 # Uncomment the following line in case you want to disable telemetry during the run time.
 # ENV NEXT_TELEMETRY_DISABLED=1
 
-# Copy production assets
-COPY --from=builder --chown=node:node /app/public ./public
-
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown node:node .next
-
-# Automatically leverage output traces to reduce image size
-# https://nextjs.org/docs/advanced-features/output-file-tracing
-COPY --from=builder --chown=node:node /app/.next/standalone ./
-COPY --from=builder --chown=node:node /app/.next/static ./.next/static
-
-# If you want to persist the fetch cache generated during the build so that
-# cached responses are available immediately on startup, uncomment this line:
-# COPY --from=builder --chown=node:node /app/.next/cache ./.next/cache
+# The app is a static export (next.config.ts: output "export"): serve out/ with the
+# dependency-free file server instead of a Next.js server.
+COPY --from=builder --chown=node:node /app/out ./out
+COPY --from=builder --chown=node:node /app/scripts/serve-out.mjs ./scripts/serve-out.mjs
 
 # Switch to non-root user for security best practices
 USER node
@@ -110,5 +99,4 @@ USER node
 # Expose port 3000 to allow HTTP traffic
 EXPOSE 3000
 
-# Start Next.js standalone server
-CMD ["node", "server.js"]
+CMD ["node", "scripts/serve-out.mjs"]

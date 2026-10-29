@@ -1,0 +1,48 @@
+# Builds the static app and publishes it to GitHub Pages (https://<user>.github.io/<repo>/).
+# One-time setup in the repository: Settings → Pages → Source: "GitHub Actions".
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Build static export
+        run: npm run build
+        env:
+          # project sites live under /<repo>; a user site (<user>.github.io) or custom domain would use ""
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+          NEXT_PUBLIC_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          NEXT_TELEMETRY_DISABLED: 1
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
