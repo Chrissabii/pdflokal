@@ -20,7 +20,8 @@ function walk(dir) {
 
 const files = walk(OUT)
   .map((p) => "/" + relative(OUT, p).split(sep).join("/"))
-  .filter((url) => url !== "/sw.js" && url !== "/.nojekyll" && !url.endsWith(".map"))
+  // dotfiles (.gitkeep, .nojekyll) are not served by GitHub Pages and would make the precache fail
+  .filter((url) => url !== "/sw.js" && !/\/\./.test(url) && !url.endsWith(".map"))
   .sort();
 
 // The bundler also emits a copy of the ONNX Runtime .wasm under _next/static/media; treat all .wasm as heavy.
