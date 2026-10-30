@@ -13,7 +13,7 @@ import { extractPages, type OcrMode, type PageText } from "@/lib/pdf/translate/e
 import { LANGUAGES, VECTOR_SCRIPTS, byCode, canOpusTarget, detectLanguage, opusRoute, type OpusStep } from "@/lib/pdf/translate/languages";
 import { DEFAULT_OLLAMA_URL, listModels, translateTexts, type OllamaModel } from "@/lib/pdf/translate/ollama";
 import { isModelCached, loadModel, translateWithOpus, type DownloadProgress } from "@/lib/pdf/translate/opus";
-import { assemble, parseGlossary, planTranslation } from "@/lib/pdf/translate/prepare";
+import { assemble, parseGlossary, planTranslation, withBuiltInGlossary } from "@/lib/pdf/translate/prepare";
 import { createRasterizer } from "@/lib/pdf/translate/raster";
 import { writeTranslatedPdf, type TranslateOutputMode } from "@/lib/pdf/translate/write";
 import { Opt, PageGrid, PageRangeInputs, Seg } from "./controls";
@@ -241,7 +241,7 @@ export function TranslateTool() {
         const targetLabel = byCode(target)?.label ?? target;
         if (source === target) throw new Error(`Das Dokument ist bereits auf ${targetLabel}.`);
 
-        const plan = planTranslation(blockTexts, parseGlossary(settings.glossary));
+        const plan = planTranslation(blockTexts, withBuiltInGlossary(parseGlossary(settings.glossary), source, target));
         const onTranslated = (done: number) => setProgress((p) => (p ? { ...p, done } : p));
         let translatedQueue: string[] | null = null;
 

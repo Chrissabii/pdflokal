@@ -46,7 +46,7 @@ export function buildLines(runs: Run[]): Line[] {
       (l) =>
         Math.abs(l.y - run.y) < Math.max(l.size, run.size) * 0.35 &&
         run.x >= l.x - run.size &&
-        run.x - l.right < Math.max(l.size, run.size) * 2.2,
+        run.x - l.right < Math.max(l.size, run.size) * 1.5,
     );
     if (line) {
       line.runs.push(run);
@@ -76,14 +76,19 @@ export const isTocLine = (text: string) => /(\.{3,}|…{2,}|\s(p|pp|pag|pg|s|sei
 
 export function buildBlocks(lines: Line[]): Group[] {
   const groups: Group[] = [];
+  // Table cells: short lines that share their baseline with other lines (a row of a table). Each one
+  // stays a block of its own, so translated cells keep their column. Lines of a two-column page
+  // layout also share baselines, but they are long and still form paragraphs.
+  const isCell = (l: Line) => l.right - l.x < l.size * 12 && lines.some((o) => o !== l && Math.abs(o.y - l.y) < l.size * 0.35);
+  const cells = new Set(lines.filter(isCell));
   for (const line of lines) {
     // TOC entries stay one block per line so page numbers keep their position
-    if (isTocLine(line.text)) {
+    if (isTocLine(line.text) || cells.has(line)) {
       groups.push({ lines: [line], x: line.x, right: line.right, size: line.size });
       continue;
     }
     const target = groups.find((g) => {
-      if (isTocLine(g.lines[g.lines.length - 1].text)) return false;
+      if (isTocLine(g.lines[g.lines.length - 1].text) || cells.has(g.lines[0])) return false;
       const last = g.lines[g.lines.length - 1];
       const gap = last.y - line.y;
       const similarSize = Math.max(g.size, line.size) / Math.min(g.size, line.size) < 1.25;

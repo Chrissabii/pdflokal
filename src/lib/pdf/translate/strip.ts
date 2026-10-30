@@ -185,8 +185,14 @@ function fontInfo(dict: PDFDict | undefined): FontInfo | undefined {
 
 // ---------- page rewriting ----------
 
+const cmyk = ([c, m, y, k]: number[]): Rgb => [(1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)];
+
+type Rgb = [number, number, number];
+
 interface GState {
   ctm: Matrix;
+  /** fill color (text is drawn with it) */
+  fill: Rgb;
   font?: FontInfo;
   fontKnown: boolean;
   size: number;
@@ -208,18 +214,23 @@ interface Context {
   boxes: Rect[];
   /** characters removed per box */
   removed: number[];
+  /** fill color of the first removed text per box */
+  colors: (Rgb | undefined)[];
   formCopies: number;
 }
 
 function decode(stream: PDFStream): Uint8Array {
-  return stream instanceof PDFRawStream ? decodePDFRawStream(stream).decode() : (stream as unknown as { getContents(): Uint8Array }).getContents();
+  if (stream instanceof PDFRawStream) return decodePDFRawStream(stream).decode();
+  // streams created by pdf-lib (e.g. its q/Q wrapper): getContents() would be the compressed bytes
+  const own = stream as unknown as { getUnencodedContents?: () => Uint8Array; getContents(): Uint8Array };
+  return own.getUnencodedContents ? own.getUnencodedContents() : own.getContents();
 }
 
 /** Rewrites one content stream; returns the edited bytes, or null if nothing changed. */
 function rewrite(bytes: Uint8Array, resources: PDFDict | undefined, ctm: Matrix, ctx: Context): Uint8Array | null {
   const edits: Edit[] = [];
   const stack: GState[] = [];
-  let g: GState = { ctm, fontKnown: false, size: 0, tc: 0, tw: 0, tz: 1, tl: 0, tr: 0 };
+  let g: GState = { ctm, fill: [0, 0, 0], fontKnown: false, size: 0, tc: 0, tw: 0, tz: 1, tl: 0, tr: 0 };
   let tm: Matrix = IDENTITY;
   let tlm: Matrix = IDENTITY;
   let operands: Operand[] = [];
@@ -275,6 +286,7 @@ function rewrite(bytes: Uint8Array, resources: PDFDict | undefined, ctm: Matrix,
     const box = chars ? boxAt(total) : -1;
     if (box >= 0) {
       ctx.removed[box] += chars;
+      ctx.colors[box] ??= g.fill;
       // same advance without glyphs; if the font's widths are unknown, draw the text invisibly instead
       const advance = known && g.size ? `[${(-(total / g.size) * 1000).toFixed(3)}] TJ` : null;
       const original = String.fromCharCode(...bytes.subarray(operandStart, end));
@@ -314,6 +326,26 @@ function rewrite(bytes: Uint8Array, resources: PDFDict | undefined, ctm: Matrix,
       case "Q":
         g = stack.pop() ?? g;
         break;
+      case "rg":
+        g.fill = [n[0], n[1], n[2]];
+        break;
+      case "g":
+        g.fill = [n[0], n[0], n[0]];
+        break;
+      case "k":
+        g.fill = cmyk(n);
+        break;
+      case "cs":
+        g.fill = [0, 0, 0];
+        break;
+      case "sc":
+      case "scn": {
+        const v = operands.filter((o) => !Array.isArray(o) && o.t === "num").map((o) => (o as { v: number }).v);
+        if (v.length === 1) g.fill = [v[0], v[0], v[0]];
+        else if (v.length === 3) g.fill = [v[0], v[1], v[2]];
+        else if (v.length === 4) g.fill = cmyk(v);
+        break;
+      }
       case "cm":
         g.ctm = mul(g.ctm, n.slice(0, 6) as Matrix);
         break;
@@ -416,11 +448,15 @@ function rewrite(bytes: Uint8Array, resources: PDFDict | undefined, ctm: Matrix,
 
 /**
  * Removes the text inside `boxes` (user space) from the page. Returns how many characters were
- * removed per box — a box with (almost) none needs to be covered the old way.
+ * removed per box — a box with (almost) none needs to be covered the old way — and the text color
+ * found in the PDF for each box.
  */
-export function removeTextInBoxes(doc: PDFDocument, page: PDFPage, boxes: Rect[]): number[] {
-  const ctx: Context = { doc, boxes, removed: boxes.map(() => 0), formCopies: 0 };
-  if (!boxes.length) return ctx.removed;
+export function removeTextInBoxes(doc: PDFDocument, page: PDFPage, boxes: Rect[]): { removed: number[]; colors: (Rgb | undefined)[] } {
+  const ctx: Context = { doc, boxes, removed: boxes.map(() => 0), colors: boxes.map(() => undefined), formCopies: 0 };
+  if (!boxes.length) return ctx;
+  // normalizing first matters: pdf-lib wraps the original content in q … Q there, which must survive
+  // in the edited stream (else a transform left open by the original would distort the translation)
+  const resources = page.node.normalizedEntries().Resources; // includes inherited resources
   const contents = page.node.Contents();
   const streams = contents instanceof PDFArray ? contents.asArray().map((r) => doc.context.lookup(r)) : [contents];
   const parts = streams.filter((s): s is PDFStream => s instanceof PDFStream).map(decode);
@@ -431,9 +467,8 @@ export function removeTextInBoxes(doc: PDFDocument, page: PDFPage, boxes: Rect[]
     joined[o + p.length] = 10;
     o += p.length + 1;
   }
-  const resources = page.node.normalizedEntries().Resources; // includes inherited resources
   const edited = rewrite(joined, resources, IDENTITY, ctx);
   // an array: pdf-lib appends its own content streams to it when the translation is drawn
   if (edited) page.node.set(PDFName.of("Contents"), doc.context.obj([doc.context.register(doc.context.flateStream(edited))]));
-  return ctx.removed;
+  return ctx;
 }

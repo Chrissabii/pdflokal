@@ -70,10 +70,13 @@ function wrapParagraph(text: string, font: PDFFont, size: number, maxWidth: numb
 /** Largest font size (≤ start) at which `text` fits into the box, with its wrapped lines. */
 export function fitText(text: string, font: PDFFont, start: number, width: number, height: number) {
   let size = Math.max(MIN_SIZE, start);
+  const words = text.split(/\s+/).filter(Boolean);
   for (;;) {
     const lineHeight = size * 1.18;
     const lines = wrapText(text, font, size, width);
-    if (lines.length * lineHeight <= height + size * 0.2 || size <= MIN_SIZE) return { size, lineHeight, lines };
+    // a long (German) word is not broken apart while shrinking to half the size still helps
+    const wordTooWide = size > Math.max(MIN_SIZE, start * 0.5) && words.some((w) => font.widthOfTextAtSize(w, size) > width);
+    if (!wordTooWide && (lines.length * lineHeight <= height + size * 0.2 || size <= MIN_SIZE)) return { size, lineHeight, lines };
     size = Math.max(MIN_SIZE, size * 0.92);
   }
 }
@@ -125,7 +128,14 @@ export async function writeTranslatedPdf(
     // centered headings may grow sideways (symmetrically) instead of wrapping
     const widthFor = (block: TextBlock) => {
       const pad = Math.max(1, block.fontSize * 0.08);
-      if (block.align !== "center") return block.width + pad;
+      if (block.align !== "center") {
+        if (block.lineCount !== 1 || block.align === "right") return block.width + pad;
+        // a one-line heading may grow to the right up to the next element on its height or the margin
+        const right = obstacles
+          .filter((o) => o !== block && o.x >= block.x + block.width - 1 && o.y < block.y + block.height && o.y + o.height > block.y)
+          .reduce((r, o) => Math.min(r, o.x - 4), crop.x + crop.width - 36);
+        return Math.max(block.width + pad, right - block.x);
+      }
       const mid = block.x + block.width / 2;
       return Math.max(block.width + pad, 2 * Math.min(mid - crop.x, crop.x + crop.width - mid) - 72);
     };
@@ -134,7 +144,8 @@ export async function writeTranslatedPdf(
     const startSize = (block: TextBlock, font: PDFFont) => {
       if (!block.widest || block.ocr) return block.fontSize;
       const w = font.widthOfTextAtSize(sanitize(block.widest.text, font), block.fontSize);
-      return w > 0 ? block.fontSize * Math.min(1, Math.max(0.6, block.widest.width / w)) : block.fontSize;
+      // only half of the correction (geometric mean): narrow display fonts would otherwise look too small
+      return w > 0 ? block.fontSize * Math.min(1, Math.max(0.75, Math.sqrt(block.widest.width / w))) : block.fontSize;
     };
     const fitted = p.blocks.map((block, bi) => {
       const font = blockFonts[bi];
@@ -159,8 +170,12 @@ export async function writeTranslatedPdf(
     // are). Only text inside photos (OCR) or text that could not be located is still covered with a box.
     const removable = p.blocks.map((b, bi) => (changed[bi] && !b.ocr ? bi : -1)).filter((bi) => bi >= 0);
     let removed: number[] = [];
+    // text color as written in the PDF (more exact than sampling the rendered page)
+    const pdfColor = new Map<number, [number, number, number]>();
     try {
-      removed = removeTextInBoxes(doc, page, removable.map((bi) => p.blocks[bi]));
+      const result = removeTextInBoxes(doc, page, removable.map((bi) => p.blocks[bi]));
+      removed = result.removed;
+      result.colors.forEach((c, k) => c && pdfColor.set(removable[k], c));
     } catch {
       // unusual content stream: fall back to covering
     }
@@ -174,7 +189,10 @@ export async function writeTranslatedPdf(
       if (!text.trim()) continue;
       const pad = Math.max(1, block.fontSize * 0.08);
       const [br, bg, bb] = block.background;
-      if (!cleared.has(bi)) {
+      // Some PDFs also carry the text baked into an image underneath (covers, banners): there the
+      // removed text would still show, so flat backgrounds below images get covered as well.
+      const overImage = (p.images ?? []).some((r) => overlapArea(r, block) > 0.5 * block.width * block.height);
+      if (!cleared.has(bi) || (overImage && (block.backgroundShare ?? 0) >= 0.5)) {
         page.drawRectangle({
           x: block.x - pad,
           y: block.y - pad,
@@ -197,7 +215,7 @@ export async function writeTranslatedPdf(
       const shared = groupSize.get(Math.round(block.fontSize * 2) / 2) ?? block.fontSize;
       const maxWidth = widthFor(block);
       const { size, lineHeight, lines } = fitText(text, font, Math.min(startSize(block, font), Math.max(shared, 0)), maxWidth, height);
-      const [r, g, b] = block.color;
+      const [r, g, b] = (cleared.has(bi) && pdfColor.get(bi)) || block.color;
       lines.forEach((line, li) => {
         const free = block.width - font.widthOfTextAtSize(line, size);
         page.drawText(line, {
@@ -282,6 +300,12 @@ export function nearlyEqual(a: string, b: string) {
     prev = cur;
   }
   return prev[y.length] <= Math.max(2, y.length * 0.05);
+}
+
+function overlapArea(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }) {
+  const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
 }
 
 /** Translation models write ™/®/© as TM/(R)/(C); put the original symbols back. */

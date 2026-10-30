@@ -408,12 +408,19 @@ async function textPage(page: PdfPage, index: number, content: TextContent, ocr?
   const images = await imageRects(page);
   const { viewport, canvas, ctx } = await renderUnrotated(page, ocr && images.length ? OCR_SCALE : 1.5);
   const style = fontStyles(page, content);
+  // a one-line heading centered on the banner/image behind it is centered, even off the page middle
+  const centerOnImage = (b: TextBlock): TextBlock => {
+    if (b.align !== "left" || b.lineCount !== 1) return b;
+    const mid = b.x + b.width / 2;
+    const img = images.find((r) => overlap(r, b) > 0.8 * b.width * b.height);
+    return img && Math.abs(mid - (img.x + img.width / 2)) < img.width * 0.03 && b.x - img.x > img.width * 0.1 ? { ...b, align: "center" } : b;
+  };
   const blocks: TextBlock[] = buildBlocks(buildLines(runs)).map((g) => {
     // the style most of the block's characters are set in
     const runsOf = g.lines.flatMap((l) => l.runs);
     const total = runsOf.reduce((n, r) => n + r.str.length, 0) || 1;
     const share = (pick: keyof FontStyle) => runsOf.reduce((n, r) => n + (r.font && style(r.font)[pick] ? r.str.length : 0), 0) / total;
-    return { ...toBlock(g, g.size, viewport, ctx), bold: share("bold") > 0.5, serif: share("serif") > 0.5 };
+    return centerOnImage({ ...toBlock(g, g.size, viewport, ctx), bold: share("bold") > 0.5, serif: share("serif") > 0.5 });
   });
 
   if (ocr && images.length) {

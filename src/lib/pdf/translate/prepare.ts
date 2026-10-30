@@ -10,6 +10,8 @@ export interface Unit {
   /** the original was written in capitals → upper-case the translation */
   caps: boolean;
   original: string;
+  /** set when the whole line is a glossary term: used as is, never sent to the engine */
+  fixed?: string;
 }
 
 const TOC_TAIL = /(\s*(?:\.{3,}|…{2,})\s*|\s+(?:p|pp|pag|pg|s|seite|page)\.?\s*)(\d{1,4})$/i;
@@ -64,12 +66,90 @@ export function cleanTranslation(text: string, source: string): string {
   }
   // collapse a word or short phrase (3+ chars) repeated 3+ times in a row
   t = t.replace(/(\p{L}[\p{L}\d\s,'-]{2,40}?)(?:\s*\1){2,}/gu, "$1");
-  return t;
+  return fixNumbers(t, source);
+}
+
+const NUMBER = /\d+(?:[.,]\d+)*/g;
+
+/**
+ * Translation models sometimes drop or change digits ("175°C" → "17°C") – fatal in a recipe.
+ * Numbers of the source that are missing in the translation replace the translation's "new"
+ * numbers, in order. Reformatting ("1.5" → "1,5") and reordering are left alone.
+ */
+export function fixNumbers(translated: string, source: string): string {
+  const digits = (s: string) => s.replace(/\D/g, "");
+  const missing = (source.match(NUMBER) ?? []).map(digits);
+  const extra: string[] = [];
+  for (const n of translated.match(NUMBER) ?? []) {
+    const i = missing.indexOf(digits(n));
+    if (i >= 0) missing.splice(i, 1);
+    else extra.push(n);
+  }
+  if (!missing.length || missing.length !== extra.length) return translated;
+  const sourceNumbers = (source.match(NUMBER) ?? []).filter((n) => missing.includes(digits(n)));
+  let k = 0;
+  return translated.replace(NUMBER, (n) => (extra.includes(n) && k < sourceNumbers.length ? sourceNumbers[k++] : n));
+}
+
+/**
+ * Kitchen terms the offline models translate wrongly (e.g. "unsalted" → "gesalzen"); used in
+ * addition to the user's own glossary, which wins on conflicts.
+ */
+const BUILT_IN: Record<string, string> = {
+  "en>de": `unsalted butter = ungesalzene Butter
+unsalted = ungesalzen
+salted butter = gesalzene Butter
+ingredients = Zutaten
+all-purpose flour = Weizenmehl
+baking soda = Natron
+baking powder = Backpulver
+parchment paper = Backpapier
+brown sugar = brauner Zucker
+powdered sugar = Puderzucker
+icing sugar = Puderzucker
+confectioners' sugar = Puderzucker
+heavy cream = Schlagsahne
+whipping cream = Schlagsahne
+stand mixer = Standmixer
+food processor = Küchenmaschine
+^directions = Zubereitung
+^instructions = Zubereitung
+^method = Zubereitung
+serving size = Portionsgröße
+^servings = Portionen
+nutrition facts = Nährwertangaben
+^calories = Kalorien
+total fat = Fett gesamt
+saturated fat = Gesättigte Fettsäuren
+trans fat = Transfette
+^cholesterol = Cholesterin
+^sodium = Natrium
+total carbohydrate = Kohlenhydrate gesamt
+^carbohydrate = Kohlenhydrate
+^carbohydrates = Kohlenhydrate
+dietary fiber = Ballaststoffe
+^sugars = Zucker
+^protein = Eiweiß
+^iron = Eisen
+^calcium = Kalzium
+prep time = Vorbereitungszeit
+cook time = Kochzeit
+cooking time = Kochzeit
+total time = Gesamtzeit
+nonstick cooking spray = Antihaft-Backspray`,
+};
+
+export function withBuiltInGlossary(user: GlossaryEntry[], source: string, target: string): GlossaryEntry[] {
+  const known = new Set(user.map((e) => e.from.toLowerCase()));
+  const extra = parseGlossary(BUILT_IN[`${source}>${target}`] ?? "").filter((e) => !known.has(e.from.toLowerCase()));
+  return [...user, ...extra].sort((a, b) => b.from.length - a.from.length);
 }
 
 export interface GlossaryEntry {
   from: string;
   to: string;
+  /** only when the term is the whole line (a heading like "Directions"), never inside a sentence */
+  whole?: boolean;
 }
 
 /** Parses lines like "pasta frolla = Mürbeteig" (also "→", "->", ";"). */
@@ -78,7 +158,7 @@ export function parseGlossary(text: string): GlossaryEntry[] {
     .split(/\n/)
     .map((line) => line.split(/\s*(?:=|→|->|;)\s*/))
     .filter((parts) => parts.length >= 2 && parts[0].trim() && parts[1].trim())
-    .map(([from, to]) => ({ from: from.trim(), to: to.trim() }))
+    .map(([from, to]) => ({ from: from.trim().replace(/^\^/, ""), to: to.trim(), whole: from.trim().startsWith("^") || undefined }))
     .sort((a, b) => b.from.length - a.from.length); // longest first: "pasta frolla" before "pasta"
 }
 
@@ -91,7 +171,8 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 export function applyGlossary(text: string, glossary: GlossaryEntry[]): string {
   let out = text;
-  for (const { from, to } of glossary) {
+  for (const { from, to, whole } of glossary) {
+    if (whole) continue;
     out = out.replace(new RegExp(`(?<![\\p{L}\\d])${escapeRe(from)}(?![\\p{L}\\d])`, "giu"), (match) =>
       match[0] === match[0].toLocaleUpperCase() ? to[0].toLocaleUpperCase() + to.slice(1) : to,
     );
@@ -112,8 +193,14 @@ export function planTranslation(blockTexts: string[], glossary: GlossaryEntry[] 
   const blocks = blockTexts.map((text) =>
     text.split("\n").map((line) => {
       const unit = toUnit(line);
-      if (unit.core && glossary.length) unit.core = applyGlossary(unit.core, glossary);
-      if (unit.core && !seen.has(unit.core)) {
+      if (unit.core && glossary.length) {
+        // a line that is just a glossary term ("Ingredients") is not translated again: the models
+        // turn single foreign words into nonsense
+        const whole = glossary.find((e) => e.from.toLowerCase() === unit.core.toLowerCase());
+        if (whole) unit.fixed = applyGlossary(unit.core, [{ ...whole, whole: undefined }]);
+        else unit.core = applyGlossary(unit.core, glossary);
+      }
+      if (unit.core && !unit.fixed && !seen.has(unit.core)) {
         seen.set(unit.core, queue.length);
         queue.push(unit.core);
       }
@@ -130,7 +217,7 @@ export function assemble(plan: Plan, translated: string[]): string[] {
     units
       .map((u) => {
         if (!u.core) return u.original;
-        let t = cleanTranslation(translated[index.get(u.core)!] ?? u.core, u.core) || u.core;
+        let t = u.fixed ?? (cleanTranslation(translated[index.get(u.core)!] ?? u.core, u.core) || u.core);
         if (u.caps) t = t.toLocaleUpperCase();
         return u.prefix + t + u.suffix;
       })

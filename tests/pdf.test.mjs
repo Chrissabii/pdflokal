@@ -63,6 +63,13 @@ test("page numbers, watermark and crop (incl. rotated pages)", async () => {
 test("translation preparation: units, caps, TOC, cleanup, glossary", () => {
   assert.equal(P.cleanTranslation("wird verwendet.....t.,.t....c", "è usata."), "wird verwendet.");
   assert.equal(P.cleanTranslation("Ja, ... aber", "Sì, ... ma"), "Ja, ... aber");
+  assert.equal(P.fixNumbers("Auf 350°F (17°C) vorheizen", "Preheat to 350°F (175°C)"), "Auf 350°F (175°C) vorheizen");
+  assert.equal(P.fixNumbers("1,5 Tassen und 2 Eier", "2 eggs and 1.5 cups"), "1,5 Tassen und 2 Eier");
+  const builtIn = P.withBuiltInGlossary([], "en", "de");
+  assert.equal(P.applyGlossary("This method makes cookies", builtIn), "This method makes cookies");
+  const dirPlan = P.planTranslation(["Directions"], builtIn);
+  assert.deepEqual([dirPlan.queue, P.assemble(dirPlan, [])], [[], ["Zubereitung"]]);
+  assert.equal(P.withBuiltInGlossary(P.parseGlossary("unsalted = ohne Salz"), "en", "de").find((e) => e.from === "unsalted").to, "ohne Salz");
   const caps = P.toUnit("FARINE PER USO DOMESTICO");
   assert.equal(caps.core, "Farine per uso domestico");
   assert.ok(caps.caps);
@@ -70,8 +77,8 @@ test("translation preparation: units, caps, TOC, cleanup, glossary", () => {
   assert.equal(P.toUnit("1000 gr").core, "");
   assert.deepEqual(["SUCCesso", "Successo", "FROLLE", "di", "pAsta,"].map(P.fixCase), ["Successo", "Successo", "FROLLE", "di", "pasta,"]);
   const plan = P.planTranslation(["FARINE\nIntroduzione p. 9", "Introduzione p. 9"], P.parseGlossary("farine = Mehle"));
-  assert.deepEqual(plan.queue, ["Mehle", "Introduzione"]);
-  assert.deepEqual(P.assemble(plan, ["Mehle", "Einleitung"]), ["MEHLE\nEinleitung p. 9", "Einleitung p. 9"]);
+  assert.deepEqual(plan.queue, ["Introduzione"]);
+  assert.deepEqual(P.assemble(plan, ["Einleitung"]), ["MEHLE\nEinleitung p. 9", "Einleitung p. 9"]);
 });
 
 test("layout keeps list line breaks and joins wrapped paragraphs", () => {
@@ -102,6 +109,14 @@ test("translated text keeps bold/serif style of the original", async () => {
   assert.ok(names.some((n) => /DejaVuSans-\d+$/.test(n)), names.join());
 });
 
+test("table cells stay separate blocks, paragraphs still join", () => {
+  const run = (str, x, y) => ({ x, y, right: x + str.length * 5, size: 10, str });
+  const rows = Lay.buildBlocks(Lay.buildLines([run("Calories", 50, 700), run("214", 120, 700), run("Total fat", 200, 700), run("Sodium", 50, 688), run("181mg", 120, 688), run("Sugars", 200, 688)]));
+  assert.equal(rows.length, 6);
+  const para = Lay.buildBlocks(Lay.buildLines([run("This family favorite casserole is good for breakfast or lunch. Add", 50, 600), run("more flavor by topping it with fresh tomato salsa.", 50, 588)]));
+  assert.equal(para.length, 1);
+});
+
 test("image pieces of one headline are merged into one OCR area", async () => {
   const pieces = [0, 1, 2].map((i) => ({ x: 100 + i * 52, y: 700, width: 50, height: 30 }));
   assert.deepEqual(Lay.mergeRects([...pieces, { x: 60, y: 200, width: 400, height: 300 }]), [
@@ -127,18 +142,24 @@ test("original text is removed from the page instead of covered (page and form X
   page.drawRectangle({ x: 0, y: 0, width: 595, height: 842, color: rgb(0.9, 0.6, 0.2) });
   page.drawPage(await outer.embedPage((await PDFDocument.load(await (async () => { inner.drawText("Ciao mondo", { x: 70, y: 700, size: 20, font: helv }); return src.save(); })())).getPage(0)));
   page.drawText("Tienimi", { x: 70, y: 500, size: 20, font: await outer.embedFont(StandardFonts.Helvetica) });
+  // like PDFs printed from Chrome/Edge: a transform that is never restored
+  const { concatTransformationMatrix } = await import("pdf-lib");
+  page.pushOperators(concatTransformationMatrix(0.5, 0, 0, 0.5, 0, 0));
   const doc = await PDFDocument.load(await outer.save());
-  const removed = removeTextInBoxes(doc, doc.getPage(0), [
+  const { removed, colors } = removeTextInBoxes(doc, doc.getPage(0), [
     { x: 65, y: 693, width: 200, height: 26 },
     { x: 65, y: 593, width: 200, height: 26 },
   ]);
   assert.ok(removed[0] >= 10 && removed[1] >= 12, String(removed));
+  assert.deepEqual(colors[0], [0, 0, 0]);
   doc.getPage(0).drawText("Hallo Welt", { x: 70, y: 700, size: 20, font: await doc.embedFont(StandardFonts.Helvetica) });
   const pdf = await getDocument({ data: await doc.save(), verbosity: 0 }).promise;
   const p = await pdf.getPage(1);
   const text = (await p.getTextContent()).items.map((i) => i.str).join("|");
   assert.equal(text.includes("Ciao") || text.includes("Pasta"), false, text);
   assert.ok(text.includes("Hallo Welt"), text);
+  const hallo = (await p.getTextContent()).items.find((i) => i.str === "Hallo Welt");
+  assert.deepEqual([hallo.transform[0], hallo.transform[4]], [20, 70], "translation drawn without the original's open transform");
   assert.ok(text.includes("Tienimi"), text);
   const ops = await p.getOperatorList();
   assert.ok(ops.fnArray.length > 5, "background drawing kept");
