@@ -7,6 +7,8 @@ export interface Run {
   right: number;
   size: number;
   str: string;
+  /** pdf.js font id, used to carry bold/serif over to the translation */
+  font?: string;
 }
 
 export interface Line {
@@ -128,4 +130,37 @@ export function groupText(lines: Line[]): string {
     else text += " " + current;
   });
   return text;
+}
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Unites touching or nearby images: headlines are often cut into several image pieces, which would
+ * be read word by word (or letter by letter) otherwise. Overlapping masks/photos become one area too.
+ */
+export function mergeRects(rects: Rect[], gap = 6): Rect[] {
+  const out = rects.map((r) => ({ ...r }));
+  const near = (a: Rect, b: Rect) =>
+    a.x - gap <= b.x + b.width && b.x - gap <= a.x + a.width && a.y - gap <= b.y + b.height && b.y - gap <= a.y + a.height;
+  for (let merged = true; merged; ) {
+    merged = false;
+    for (let i = 0; i < out.length && !merged; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        if (!near(out[i], out[j])) continue;
+        const [a, b] = [out[i], out[j]];
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        out[i] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
+        out.splice(j, 1);
+        merged = true;
+        break;
+      }
+    }
+  }
+  return out;
 }

@@ -8,6 +8,9 @@ export type TranslateOutputMode = "layout" | "text";
 export interface FontBytes {
   regular: ArrayBuffer;
   bold: ArrayBuffer;
+  /** used for blocks whose original font was a serif font */
+  serif?: ArrayBuffer;
+  serifBold?: ArrayBuffer;
 }
 
 const MIN_SIZE = 4;
@@ -92,7 +95,14 @@ export async function writeTranslatedPdf(
 
   const doc = await PDFDocument.load(original, { ignoreEncryption: true });
   doc.registerFontkit(fontkit);
-  const font = await doc.embedFont(fonts.regular, { subset: true });
+  // fonts are embedded only when a block needs them
+  const embedded = new Map<ArrayBuffer, Promise<PDFFont>>();
+  const fontFor = (block: TextBlock) => {
+    const sans = block.bold ? fonts.bold : fonts.regular;
+    const bytes = block.serif ? ((block.bold ? fonts.serifBold : fonts.serif) ?? sans) : sans;
+    if (!embedded.has(bytes)) embedded.set(bytes, doc.embedFont(bytes, { subset: true }));
+    return embedded.get(bytes)!;
+  };
 
   for (const [pi, p] of pages.entries()) {
     const page = doc.getPage(p.index);
@@ -107,7 +117,9 @@ export async function writeTranslatedPdf(
       const room = Math.max(0, block.y - below - block.fontSize * 0.6);
       return block.height + Math.min(room, block.height * 1.5 + block.fontSize * 1.2);
     };
+    const blockFonts = await Promise.all(p.blocks.map(fontFor));
     const fitted = p.blocks.map((block, bi) => {
+      const font = blockFonts[bi];
       const text = sanitize(translations[pi]?.[bi] ?? block.text, font);
       const pad = Math.max(1, block.fontSize * 0.08);
       return options.rasterize || !text.trim() ? null : fitText(text, font, block.fontSize, block.width + pad, roomFor(block)).size;
@@ -123,6 +135,7 @@ export async function writeTranslatedPdf(
 
     for (const [bi, block] of p.blocks.entries()) {
       const raw = translations[pi]?.[bi] ?? block.text;
+      const font = blockFonts[bi];
       const text = options.rasterize ? raw : sanitize(raw, font);
       if (!text.trim()) continue;
       const pad = Math.max(1, block.fontSize * 0.08);
@@ -138,7 +151,7 @@ export async function writeTranslatedPdf(
       // (up to the next block that shares its column) before shrinking the font.
       const height = roomFor(block);
       if (options.rasterize) {
-        const img = await options.rasterize({ text, width: block.width + pad, height, fontSize: block.fontSize, color: block.color });
+        const img = await options.rasterize({ text, width: block.width + pad, height, fontSize: block.fontSize, color: block.color, bold: block.bold });
         if (img) {
           const png = await doc.embedPng(img.png);
           page.drawImage(png, { x: block.x, y: block.y + block.height - img.height, width: block.width + pad, height: img.height });

@@ -3,8 +3,8 @@
 // Coordinates are PDF user space (origin bottom-left), the same space pdf-lib draws in.
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { Worker as TesseractWorker } from "tesseract.js";
-import { createOcr, recognizeCanvas } from "./ocr";
-import { buildBlocks, buildLines, groupText, isHorizontal, type Line, type Run } from "./layout";
+import { createOcr, recognizeCanvas, type OcrFilter, type OcrLine } from "./ocr";
+import { buildBlocks, buildLines, groupText, isHorizontal, mergeRects, type Line, type Rect, type Run } from "./layout";
 
 export interface TextBlock {
   /** bounding box in user space */
@@ -18,6 +18,9 @@ export interface TextBlock {
   /** sampled from the rendered page, 0..1 */
   color: [number, number, number];
   background: [number, number, number];
+  /** style of the original font (digital text only) */
+  bold?: boolean;
+  serif?: boolean;
 }
 
 export interface PageText {
@@ -38,10 +41,16 @@ export interface ExtractOptions {
   onPage?: (done: number) => void;
   /** OCR progress of the current page, 0..1 */
   onOcr?: (pageIndex: number, progress: number) => void;
+  /** text sampled across the whole document (for language detection) */
+  onSampleText?: (text: string) => void;
 }
 
 /** Pages with fewer selectable characters than this count as scanned in "auto" mode. */
 const SCANNED_THRESHOLD = 20;
+/** Images smaller than this (pt) are not searched for text (icons, bullets, logos). */
+const MIN_IMAGE = { width: 60, height: 24 };
+/** Render scale for OCR (~216 dpi). */
+const OCR_SCALE = 3;
 
 
 type Rgb = [number, number, number];
@@ -112,16 +121,34 @@ export async function extractPages(
   let ocrLangs: string[] | null = options.ocrLangs === "auto" ? null : options.ocrLangs;
   let ocrPageIndex = 0;
 
-  // first pass: how much selectable text does each page have?
+  // first pass: how much selectable text does each page have? Besides the selected pages, a spread of
+  // the whole document is sampled, so translating just a photo cover doesn't count as a "scan".
   const contents = new Map<number, TextContent>();
+  const spread = Array.from({ length: Math.min(12, doc.numPages) }, (_, i) => Math.floor((i * doc.numPages) / Math.min(12, doc.numPages)));
+  const sampled = [...new Set([...pageIndices, ...spread])];
   let lowText = 0;
-  for (const index of pageIndices) {
+  let sampleText = "";
+  for (const index of sampled) {
     const page = await doc.getPage(index + 1);
     const content = await page.getTextContent();
-    contents.set(index, content);
-    if (content.items.reduce((n, it) => n + ("str" in it ? it.str.trim().length : 0), 0) < SCANNED_THRESHOLD) lowText++;
+    if (pageIndices.includes(index)) contents.set(index, content);
+    const text = content.items.map((it) => ("str" in it ? it.str : "")).join(" ");
+    if (text.replace(/\s/g, "").length < SCANNED_THRESHOLD) lowText++;
+    if (sampleText.length < 5000) sampleText += ` ${text}`;
   }
-  const scannedDocument = pageIndices.length > 0 && lowText / pageIndices.length >= 0.6;
+  const scannedDocument = sampled.length > 0 && lowText / sampled.length >= 0.6;
+  // a few words on a cover are too little to tell the language; the caller can use this sample too
+  options.onSampleText?.(sampleText.slice(0, 5000));
+  if (!ocrLangs && !scannedDocument) {
+    // digital document: the language for text inside images is the language of the text layer
+    const detected = options.detect?.(sampleText.slice(0, 5000));
+    ocrLangs = detected && BUNDLED_OCR.includes(detected) ? [detected] : BUNDLED_OCR;
+  }
+  // text inside photos/graphics of digital pages is read with OCR unless OCR is switched off
+  const imageOcr =
+    options.ocr === "off"
+      ? undefined
+      : async () => (ocrWorker ??= await createOcr(ocrLangs ?? BUNDLED_OCR, (p) => options.onOcr?.(ocrPageIndex, p)));
 
   try {
     for (const index of pageIndices) {
@@ -145,7 +172,8 @@ export async function extractPages(
           }
         }
       } else {
-        result.push(await textPage(page, index, content));
+        ocrPageIndex = index;
+        result.push(await textPage(page, index, content, imageOcr));
       }
       page.cleanup();
       contents.delete(index);
@@ -172,47 +200,118 @@ async function renderUnrotated(page: PdfPage, scale: number) {
   return { viewport, canvas, ctx };
 }
 
-/** Page with selectable text: group pdf.js text runs into blocks, sample colors from a render. */
-async function textPage(page: PdfPage, index: number, content: TextContent): Promise<PageText> {
-  const runs: Run[] = [];
-  let skipped = 0;
-  for (const item of content.items) {
-    if (!("str" in item) || !item.str) continue;
-    if (!isHorizontal(item.transform)) {
-      if (item.str.trim()) skipped++;
-      continue;
-    }
-    const size = item.transform[3];
-    runs.push({ x: item.transform[4], y: item.transform[5], right: item.transform[4] + item.width, size, str: item.str });
-  }
-  const groups = buildBlocks(buildLines(runs));
-  const { viewport, canvas, ctx } = await renderUnrotated(page, 1.5);
 
-  const blocks: TextBlock[] = groups.map((g) => {
-    const first = g.lines[0];
-    const last = g.lines[g.lines.length - 1];
-    const top = first.y + first.size * 0.95;
-    const bottom = last.y - last.size * 0.28;
-    const box = { x: g.x, y: bottom, width: g.right - g.x, height: top - bottom };
-    const [x1, y1] = viewport.convertToViewportPoint(box.x, top);
-    const [x2, y2] = viewport.convertToViewportPoint(box.x + box.width, bottom);
-    const colors = sampleColors(ctx, {
-      left: Math.min(x1, x2),
-      top: Math.min(y1, y2),
-      width: Math.abs(x2 - x1),
-      height: Math.abs(y2 - y1),
-    });
-    return { ...box, fontSize: g.size, text: groupText(g.lines), lineCount: g.lines.length, ...colors };
+type Viewport = ReturnType<PdfPage["getViewport"]>;
+type Matrix = [number, number, number, number, number, number];
+
+const multiply = (m: Matrix, n: Matrix): Matrix => [
+  m[0] * n[0] + m[2] * n[1],
+  m[1] * n[0] + m[3] * n[1],
+  m[0] * n[2] + m[2] * n[3],
+  m[1] * n[2] + m[3] * n[3],
+  m[0] * n[4] + m[2] * n[5] + m[4],
+  m[1] * n[4] + m[3] * n[5] + m[5],
+];
+
+/** Bounding boxes (user space) of the raster images painted on the page, clipped to the page. */
+async function imageRects(page: PdfPage): Promise<Rect[]> {
+  const { OPS } = await import("pdfjs-dist");
+  const list = await page.getOperatorList({ intent: "print" });
+  const [px0, py0, px1, py1] = page.view;
+  const rects: Rect[] = [];
+  const stack: Matrix[] = [];
+  let ctm: Matrix = [1, 0, 0, 1, 0, 0];
+  list.fnArray.forEach((fn, i) => {
+    const args = list.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() ?? ctm;
+    else if (fn === OPS.transform) ctm = multiply(ctm, args as Matrix);
+    else if (fn === OPS.paintFormXObjectBegin) {
+      stack.push(ctm);
+      if (Array.isArray(args?.[0]) && args[0].length === 6) ctm = multiply(ctm, args[0] as Matrix);
+    } else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() ?? ctm;
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
+      // an image fills the unit square of the current transform
+      const xs = [0, 1, 0, 1].map((u, k) => ctm[0] * u + ctm[2] * [0, 0, 1, 1][k] + ctm[4]);
+      const ys = [0, 1, 0, 1].map((u, k) => ctm[1] * u + ctm[3] * [0, 0, 1, 1][k] + ctm[5]);
+      const x = Math.max(px0, Math.min(...xs));
+      const y = Math.max(py0, Math.min(...ys));
+      const width = Math.min(px1, Math.max(...xs)) - x;
+      const height = Math.min(py1, Math.max(...ys)) - y;
+      if (width > 1 && height > 1) rects.push({ x, y, width, height });
+    }
   });
-  canvas.width = canvas.height = 0;
-  return { index, blocks: blocks.filter((b) => /[\p{L}]/u.test(b.text)), skipped, ocr: false };
+  return mergeRects(rects).filter((r) => r.width >= MIN_IMAGE.width && r.height >= MIN_IMAGE.height);
 }
 
-/** Scanned page: render at ~216 dpi, OCR it, and group the recognized lines into blocks. */
-async function ocrPage(page: PdfPage, index: number, worker: TesseractWorker): Promise<PageText> {
-  const scale = 3;
-  const { viewport, canvas, ctx } = await renderUnrotated(page, scale);
-  const ocrLines = await recognizeCanvas(worker, canvas);
+function overlap(a: Rect, b: Rect) {
+  const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+interface FontStyle {
+  bold: boolean;
+  serif: boolean;
+}
+
+const BOLD = /bold|black|heavy|semibold|demi/i;
+const SANS = /sans|grotesk|gothic|arial|helvetica|verdana|lato|roboto|open|montserrat|inter|calibri|segoe|futura|avenir/i;
+const SERIF = /serif|times|georgia|garamond|roman|minion|playfair|baskerville|bodoni|cambria|caslon|palatino|didot|book/i;
+
+/**
+ * Draws a letter with feet ("I", "l", "n" …) in the PDF's own font, which pdf.js has loaded for
+ * rendering, and checks whether the bottom of the stroke is clearly wider than its middle (serifs).
+ */
+function hasSerifs(fontFace: string, sample: string) {
+  const letter = [..."Ilihnmr"].find((ch) => sample.includes(ch));
+  if (!letter || !document.fonts.check(`100px "${fontFace}"`)) return undefined;
+  const canvas = document.createElement("canvas");
+  canvas.width = 160;
+  canvas.height = 140;
+  const g = canvas.getContext("2d", { willReadFrequently: true })!;
+  g.font = `100px "${fontFace}"`;
+  g.fillText(letter, 30, 110);
+  const m = g.measureText(letter);
+  const inked = (y: number) => {
+    const d = g.getImageData(0, y, canvas.width, 1).data;
+    let n = 0;
+    for (let i = 3; i < d.length; i += 4) if (d[i] > 128) n++;
+    return n;
+  };
+  const stem = inked(Math.round(110 - (m.actualBoundingBoxAscent || 70) * 0.45));
+  const foot = inked(107);
+  return stem > 0 ? foot > stem * 1.5 : undefined;
+}
+
+/**
+ * Bold/serif of the page's fonts, from the embedded font name ("ABCDEF+Lato-Bold") once the page has
+ * been rendered; fonts with unknown names are checked visually, else pdf.js' generic family is used.
+ */
+function fontStyles(page: PdfPage, content: TextContent) {
+  const cache = new Map<string, FontStyle>();
+  return (id: string): FontStyle => {
+    let s = cache.get(id);
+    if (!s) {
+      let font: { name?: string; loadedName?: string } | undefined;
+      try {
+        font = page.commonObjs.get(id) as typeof font;
+      } catch {
+        // font not resolved
+      }
+      const name = font?.name ?? "";
+      const known = SANS.test(name) ? false : SERIF.test(name) ? true : undefined;
+      const sample = content.items.map((it) => ("str" in it && it.fontName === id ? it.str : "")).join("");
+      const serif = known ?? (font?.loadedName ? hasSerifs(font.loadedName, sample) : undefined) ?? content.styles[id]?.fontFamily === "serif";
+      s = { bold: BOLD.test(name), serif };
+      cache.set(id, s);
+    }
+    return s;
+  };
+}
+
+/** Converts OCR lines (pixels of a canvas rendered with `viewport`) into text blocks. */
+function ocrBlocks(ocrLines: OcrLine[], viewport: Viewport, ctx: CanvasRenderingContext2D): TextBlock[] {
   const lines: Line[] = ocrLines.map((l) => {
     const [ux0, uy0] = viewport.convertToPdfPoint(l.x0, l.y1); // bottom-left
     const [ux1, uy1] = viewport.convertToPdfPoint(l.x1, l.y0); // top-right
@@ -229,30 +328,117 @@ async function ocrPage(page: PdfPage, index: number, worker: TesseractWorker): P
     };
   });
   lines.sort((a, b) => b.y - a.y || a.x - b.x);
-  const blocks: TextBlock[] = buildBlocks(lines).map((g) => {
-    const first = g.lines[0];
-    const last = g.lines[g.lines.length - 1];
-    const top = first.y + first.size * 0.95;
-    const bottom = last.y - last.size * 0.28;
-    const box = { x: g.x, y: bottom, width: g.right - g.x, height: top - bottom };
-    const [x1, y1] = viewport.convertToViewportPoint(box.x, top);
-    const [x2, y2] = viewport.convertToViewportPoint(box.x + box.width, bottom);
-    const colors = sampleColors(ctx, {
-      left: Math.min(x1, x2),
-      top: Math.min(y1, y2),
-      width: Math.abs(x2 - x1),
-      height: Math.abs(y2 - y1),
-    });
+  return buildBlocks(lines).map((g) => {
     // OCR sizes vary a little from line to line; use the block's median
     const sizes = g.lines.map((l) => l.size).sort((a, b) => a - b);
-    return {
-      ...box,
-      fontSize: sizes[Math.floor(sizes.length / 2)],
-      text: groupText(g.lines),
-      lineCount: g.lines.length,
-      ...colors,
-    };
+    return toBlock(g, sizes[Math.floor(sizes.length / 2)], viewport, ctx);
   });
+}
+
+function toBlock(g: ReturnType<typeof buildBlocks>[number], fontSize: number, viewport: Viewport, ctx: CanvasRenderingContext2D): TextBlock {
+  const first = g.lines[0];
+  const last = g.lines[g.lines.length - 1];
+  const top = first.y + first.size * 0.95;
+  const bottom = last.y - last.size * 0.28;
+  const box = { x: g.x, y: bottom, width: g.right - g.x, height: top - bottom };
+  const [x1, y1] = viewport.convertToViewportPoint(box.x, top);
+  const [x2, y2] = viewport.convertToViewportPoint(box.x + box.width, bottom);
+  const colors = sampleColors(ctx, {
+    left: Math.min(x1, x2),
+    top: Math.min(y1, y2),
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+  });
+  return { ...box, fontSize, text: groupText(g.lines), lineCount: g.lines.length, ...colors };
+}
+
+/**
+ * Page with selectable text: group pdf.js text runs into blocks, sample colors from a render.
+ * With `ocr`, text inside the page's images (photos with captions, scanned figures …) is recognized
+ * too and added as extra blocks, skipping anything already covered by the text layer.
+ */
+async function textPage(page: PdfPage, index: number, content: TextContent, ocr?: () => Promise<TesseractWorker>): Promise<PageText> {
+  const runs: Run[] = [];
+  let skipped = 0;
+  for (const item of content.items) {
+    if (!("str" in item) || !item.str) continue;
+    if (!isHorizontal(item.transform)) {
+      if (item.str.trim()) skipped++;
+      continue;
+    }
+    const size = item.transform[3];
+    runs.push({ x: item.transform[4], y: item.transform[5], right: item.transform[4] + item.width, size, str: item.str, font: item.fontName });
+  }
+  const images = ocr ? await imageRects(page) : [];
+  const { viewport, canvas, ctx } = await renderUnrotated(page, images.length ? OCR_SCALE : 1.5);
+  const style = fontStyles(page, content);
+  const blocks: TextBlock[] = buildBlocks(buildLines(runs)).map((g) => {
+    // the style most of the block's characters are set in
+    const runsOf = g.lines.flatMap((l) => l.runs);
+    const total = runsOf.reduce((n, r) => n + r.str.length, 0) || 1;
+    const share = (pick: keyof FontStyle) => runsOf.reduce((n, r) => n + (r.font && style(r.font)[pick] ? r.str.length : 0), 0) / total;
+    return { ...toBlock(g, g.size, viewport, ctx), bold: share("bold") > 0.5, serif: share("serif") > 0.5 };
+  });
+
+  if (ocr && images.length) {
+    const worker = await ocr();
+    for (const img of images) {
+      const [ax, ay] = viewport.convertToViewportPoint(img.x, img.y + img.height);
+      const [bx, by] = viewport.convertToViewportPoint(img.x + img.width, img.y);
+      const left = Math.max(0, Math.floor(Math.min(ax, bx)));
+      const top = Math.max(0, Math.floor(Math.min(ay, by)));
+      const region = { left, top, width: Math.min(canvas.width - left, Math.ceil(Math.abs(bx - ax))), height: Math.min(canvas.height - top, Math.ceil(Math.abs(by - ay))) };
+      const found = await recognizeRegion(worker, canvas, region, "strict");
+      for (const b of ocrBlocks(found, viewport, ctx)) {
+        // text drawn on top of the image is already in the text layer
+        if (!blocks.some((v) => overlap(v, b) > 0.3 * b.width * b.height)) blocks.push(b);
+      }
+    }
+  }
+  canvas.width = canvas.height = 0;
+  return { index, blocks: blocks.filter((b) => /[\p{L}]/u.test(b.text)), skipped, ocr: false };
+}
+
+/**
+ * OCR of a canvas region in three sizes: Tesseract reads big headlines best at ~72 dpi and small print
+ * at full resolution. Lines found in a coarser pass win where passes overlap.
+ * Returned coordinates are pixels of the full canvas.
+ */
+async function recognizeRegion(
+  worker: TesseractWorker,
+  canvas: HTMLCanvasElement,
+  region: { left: number; top: number; width: number; height: number },
+  filter: OcrFilter,
+): Promise<OcrLine[]> {
+  const { left, top, width, height } = region;
+  const found: OcrLine[] = [];
+  if (width < 8 || height < 8) return found;
+  const box = (l: OcrLine) => ({ x: l.x0, y: l.y0, width: l.x1 - l.x0, height: l.y1 - l.y0 });
+  for (const factor of [1 / OCR_SCALE, 2 / OCR_SCALE, 1]) {
+    const crop = document.createElement("canvas");
+    crop.width = Math.max(1, Math.round(width * factor));
+    crop.height = Math.max(1, Math.round(height * factor));
+    const cropCtx = crop.getContext("2d")!;
+    cropCtx.imageSmoothingQuality = "high";
+    cropCtx.drawImage(canvas, left, top, width, height, 0, 0, crop.width, crop.height);
+    const lines = (await recognizeCanvas(worker, crop, filter)).map((l) => ({
+      ...l,
+      x0: l.x0 / factor + left,
+      x1: l.x1 / factor + left,
+      y0: l.y0 / factor + top,
+      y1: l.y1 / factor + top,
+    }));
+    crop.width = crop.height = 0;
+    found.push(...lines.filter((l) => !found.some((f) => overlap(box(f), box(l)) > 0.3 * box(l).width * box(l).height)));
+  }
+  return found;
+}
+
+/** Scanned page: render at ~216 dpi, OCR it, and group the recognized lines into blocks. */
+async function ocrPage(page: PdfPage, index: number, worker: TesseractWorker): Promise<PageText> {
+  const { viewport, canvas, ctx } = await renderUnrotated(page, OCR_SCALE);
+  const lines = await recognizeRegion(worker, canvas, { left: 0, top: 0, width: canvas.width, height: canvas.height }, "scan");
+  const blocks = ocrBlocks(lines, viewport, ctx);
   canvas.width = canvas.height = 0;
   return { index, blocks, skipped: 0, ocr: true };
 }

@@ -211,11 +211,13 @@ export function TranslateTool() {
         setProgress({ phase: "extract", done: 0, total: indices.length, startedAt: Date.now() });
         const doc = await openPdf(file.bytes);
         let pages: PageText[];
+        let documentSample = "";
         try {
           pages = await extractPages(doc, indices, {
             ocr: settings.ocr,
             ocrLangs: sourceOcr ? [sourceOcr] : settings.source === "auto" ? "auto" : ["eng"],
             detect: (t) => byCode(detectLanguage(t))?.ocr,
+            onSampleText: (t) => (documentSample = t),
             onPage: (done) => setProgress((p) => (p ? { ...p, done, detail: undefined } : p)),
             onOcr: (page, pr) =>
               setProgress((p) => (p ? { ...p, detail: `Texterkennung (OCR) Seite ${page + 1}: ${Math.round(pr * 100)} %` } : p)),
@@ -233,7 +235,7 @@ export function TranslateTool() {
           );
         }
 
-        const source = settings.source === "auto" ? detectLanguage(blockTexts.join(" ")) : settings.source;
+        const source = settings.source === "auto" ? detectLanguage(`${blockTexts.join(" ")} ${documentSample}`) : settings.source;
         const target = settings.target;
         const sourceLabel = byCode(source)?.label ?? source;
         const targetLabel = byCode(target)?.label ?? target;
@@ -306,12 +308,14 @@ export function TranslateTool() {
         const translatedBlocks = assemble(plan, translatedQueue);
         let k = 0;
         const perPage = pages.map((p) => p.blocks.map(() => translatedBlocks[k++]));
-        const [regular, bold] = await Promise.all(
-          ["/fonts/DejaVuSans.ttf", "/fonts/DejaVuSans-Bold.ttf"].map((u) => fetch(withBase(u)).then((r) => r.arrayBuffer())),
+        const [regular, bold, serif, serifBold] = await Promise.all(
+          ["/fonts/DejaVuSans.ttf", "/fonts/DejaVuSans-Bold.ttf", "/fonts/DejaVuSerif.ttf", "/fonts/DejaVuSerif-Bold.ttf"].map((u) =>
+            fetch(withBase(u)).then((r) => r.arrayBuffer()),
+          ),
         );
         const script = byCode(target)?.script ?? "latn";
         const rasterize = VECTOR_SCRIPTS.has(script) ? undefined : createRasterizer(RTL.has(target));
-        const bytes = await writeTranslatedPdf(file.bytes, pages, perPage, settings.mode, { regular, bold }, { rasterize });
+        const bytes = await writeTranslatedPdf(file.bytes, pages, perPage, settings.mode, { regular, bold, serif, serifBold }, { rasterize });
         const suffix = settings.mode === "text" ? "_übersetzt_text" : "_übersetzt";
         return [{ name: `${file.file.name.replace(/\.pdf$/i, "")}${suffix}.pdf`, bytes }];
       } catch (err) {
@@ -385,7 +389,7 @@ export function TranslateTool() {
                 ]}
               />
             </Opt>
-            <Opt title="Texterkennung (OCR) für Scans:">
+            <Opt title="Texterkennung (OCR) für Scans und Bilder:">
               <Seg
                 value={settings.ocr}
                 onChange={(ocr) => update({ ocr })}
@@ -396,7 +400,7 @@ export function TranslateTool() {
                 ]}
               />
               <p className="tl-summary" style={{ marginTop: 6 }}>
-                Automatisch erkennt eingescannte Dokumente selbst. Offline-Texterkennung für Deutsch, Englisch, Französisch, Spanisch,
+                Automatisch erkennt eingescannte Dokumente selbst und liest auch Schrift in Fotos und Grafiken. Offline-Texterkennung für Deutsch, Englisch, Französisch, Spanisch,
                 Italienisch und Niederländisch.
               </p>
             </Opt>

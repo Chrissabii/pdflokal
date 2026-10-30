@@ -20,6 +20,8 @@ const copies = [
   [join(pkgDir("pdfjs-dist"), "build", "pdf.worker.min.mjs"), "public/pdfjs/pdf.worker.min.mjs"],
   [join(pkgDir("dejavu-fonts-ttf"), "ttf", "DejaVuSans.ttf"), "public/fonts/DejaVuSans.ttf"],
   [join(pkgDir("dejavu-fonts-ttf"), "ttf", "DejaVuSans-Bold.ttf"), "public/fonts/DejaVuSans-Bold.ttf"],
+  [join(pkgDir("dejavu-fonts-ttf"), "ttf", "DejaVuSerif.ttf"), "public/fonts/DejaVuSerif.ttf"],
+  [join(pkgDir("dejavu-fonts-ttf"), "ttf", "DejaVuSerif-Bold.ttf"), "public/fonts/DejaVuSerif-Bold.ttf"],
   [join(pkgDir("tesseract.js"), "dist", "worker.min.js"), "public/tesseract/worker.min.js"],
 ];
 

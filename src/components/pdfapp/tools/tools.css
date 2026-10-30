@@ -282,6 +282,11 @@
 }
 .tl-seg__btn:hover { background: #ebebf4; border-color: #707078; }
 .tl-seg__btn[aria-pressed="true"] { background: #f5f5fa; border-color: #707078; color: #161616; font-weight: 500; }
+/* narrow slide-over panel on phones: let long labels wrap instead of being cut off */
+@media (max-width: 840px) {
+  .tl-seg { flex-wrap: wrap; }
+  .tl-seg__btn { min-width: max-content; padding-inline: 10px; }
+}
 
 .tl-grid9 { display: grid; grid-template-columns: repeat(3, 32px); gap: 4px; }
 .tl-grid9 button {

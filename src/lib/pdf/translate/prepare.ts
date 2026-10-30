@@ -137,3 +137,15 @@ export function assemble(plan: Plan, translated: string[]): string[] {
       .join("\n"),
   );
 }
+
+/**
+ * Tesseract confuses c/C, s/S, o/O … in display fonts ("SUCCesso"). A word that is neither lower case,
+ * Capitalized nor ALL CAPS is turned into lower case, keeping a capital first letter.
+ */
+export function fixCase(word: string) {
+  const letters = word.replace(/[^\p{L}]/gu, "");
+  if (letters.length < 2 || /^\p{Lu}?\p{Ll}*$/u.test(letters) || /^\p{Lu}+$/u.test(letters)) return word;
+  const lower = word.toLowerCase();
+  const first = word.search(/\p{L}/u);
+  return /\p{Lu}/u.test(word[first]) ? lower.slice(0, first) + lower[first].toUpperCase() + lower.slice(first + 1) : lower;
+}

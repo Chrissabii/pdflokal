@@ -68,6 +68,7 @@ test("translation preparation: units, caps, TOC, cleanup, glossary", () => {
   assert.ok(caps.caps);
   assert.equal(P.toUnit("Introduzione p. 9").suffix, " p. 9");
   assert.equal(P.toUnit("1000 gr").core, "");
+  assert.deepEqual(["SUCCesso", "Successo", "FROLLE", "di", "pAsta,"].map(P.fixCase), ["Successo", "Successo", "FROLLE", "di", "pasta,"]);
   const plan = P.planTranslation(["FARINE\nIntroduzione p. 9", "Introduzione p. 9"], P.parseGlossary("farine = Mehle"));
   assert.deepEqual(plan.queue, ["Mehle", "Introduzione"]);
   assert.deepEqual(P.assemble(plan, ["Mehle", "Einleitung"]), ["MEHLE\nEinleitung p. 9", "Einleitung p. 9"]);
@@ -83,6 +84,27 @@ test("layout keeps list line breaks and joins wrapped paragraphs", () => {
     Lay.groupText([line("Generalmente le farine che si trovano al super-", 50, 400, 700), line("mercato si dividono.", 50, 200, 688)]),
     "Generalmente le farine che si trovano al supermercato si dividono.",
   );
+});
+
+test("translated text keeps bold/serif style of the original", async () => {
+  const W = await import("../src/lib/pdf/translate/write.ts");
+  const { readFileSync } = await import("node:fs");
+  const font = (name) => readFileSync(new URL(`../node_modules/dejavu-fonts-ttf/ttf/${name}.ttf`, import.meta.url)).buffer;
+  const fonts = { regular: font("DejaVuSans"), bold: font("DejaVuSans-Bold"), serif: font("DejaVuSerif"), serifBold: font("DejaVuSerif-Bold") };
+  const block = (text, style) => ({ x: 70, y: 600, width: 300, height: 30, fontSize: 20, text, lineCount: 1, color: [0, 0, 0], background: [1, 1, 1], ...style });
+  const pagesIn = [{ index: 0, skipped: 0, ocr: false, blocks: [block("Titel", { serif: true, bold: true }), { ...block("Text", {}), y: 500 }] }];
+  const out = await PDFDocument.load(await W.writeTranslatedPdf(A, pagesIn, [["Überschrift", "Fließtext"]], "layout", fonts));
+  const names = out.context.enumerateIndirectObjects().map(([, o]) => String(o.get?.(out.context.obj("BaseFont")) ?? "")).filter(Boolean);
+  assert.ok(names.some((n) => n.includes("DejaVuSerif-Bold")), names.join());
+  assert.ok(names.some((n) => /DejaVuSans-\d+$/.test(n)), names.join());
+});
+
+test("image pieces of one headline are merged into one OCR area", async () => {
+  const pieces = [0, 1, 2].map((i) => ({ x: 100 + i * 52, y: 700, width: 50, height: 30 }));
+  assert.deepEqual(Lay.mergeRects([...pieces, { x: 60, y: 200, width: 400, height: 300 }]), [
+    { x: 100, y: 700, width: 154, height: 30 },
+    { x: 60, y: 200, width: 400, height: 300 },
+  ]);
 });
 
 test("language detection and translation routes", () => {

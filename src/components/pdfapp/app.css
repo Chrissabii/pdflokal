@@ -54,8 +54,16 @@
   z-index: 1041;
   height: 60px;
   padding: 0 24px;
-  background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--line);
+}
+/* the blur lives on a pseudo-element: backdrop-filter on .pa-header itself would trap the fixed
+   mobile menu inside the 60px bar */
+.pa-header::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgba(255, 255, 255, 0.92);
   backdrop-filter: blur(8px);
 }
 .pa-header nav { display: flex; align-items: center; gap: 24px; height: 100%; }

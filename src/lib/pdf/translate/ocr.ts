@@ -2,6 +2,7 @@
 // from public/tesseract, so recognition works offline.
 import type { Worker as TesseractWorker } from "tesseract.js";
 import { withBase } from "@/lib/base";
+import { fixCase } from "./prepare";
 
 export interface OcrLine {
   /** pixel bbox on the rendered canvas */
@@ -36,7 +37,31 @@ interface TLine {
   text: string;
   bbox: TBox;
   confidence: number;
+  words: { text: string; confidence: number }[];
 }
+
+/**
+ * Photos produce plenty of "text" from textures. A line is only trusted when it is confident overall,
+ * mostly letters, and contains at least one real-looking word read with high confidence. Inside images
+ * of digital PDFs ("strict") the bar is higher than on scanned pages ("scan").
+ */
+const FILTERS = {
+  strict: { line: 65, word: 80, letters: 0.6 },
+  scan: { line: 55, word: 70, letters: 0.5 },
+};
+export type OcrFilter = keyof typeof FILTERS;
+
+function looksLikeText(l: TLine, filter: OcrFilter) {
+  const f = FILTERS[filter];
+  const text = l.text.replace(/\s+/g, "");
+  const letters = (text.match(/\p{L}/gu) ?? []).length;
+  return (
+    l.confidence >= f.line &&
+    letters >= text.length * f.letters &&
+    l.words.some((w) => w.confidence >= f.word && (w.text.match(/\p{L}/gu) ?? []).length >= 3)
+  );
+}
+
 interface TParagraph {
   text: string;
   bbox: TBox;
@@ -50,16 +75,17 @@ interface TBlock {
 /**
  * Returns recognized text lines. Lines (not Tesseract's paragraphs) are returned because Tesseract
  * often splits one paragraph mid-sentence; the caller groups lines with the same logic as for digital PDFs.
+ * `filter` decides how sure Tesseract must be (see FILTERS).
  */
-export async function recognizeCanvas(worker: TesseractWorker, canvas: HTMLCanvasElement): Promise<OcrLine[]> {
+export async function recognizeCanvas(worker: TesseractWorker, canvas: HTMLCanvasElement, filter: OcrFilter): Promise<OcrLine[]> {
   const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
   const blocks = (data as unknown as { blocks: TBlock[] | null }).blocks ?? [];
   const out: OcrLine[] = [];
   for (const block of blocks) {
     for (const p of block.paragraphs) {
       for (const l of p.lines) {
-        const text = l.text.replace(/\s+/g, " ").trim();
-        if (l.confidence >= 40 && /\p{L}{2}/u.test(text)) out.push({ ...l.bbox, text, confidence: l.confidence });
+        const text = l.text.replace(/\s+/g, " ").trim().split(" ").map(fixCase).join(" ");
+        if (looksLikeText(l, filter)) out.push({ ...l.bbox, text, confidence: l.confidence });
       }
     }
   }
