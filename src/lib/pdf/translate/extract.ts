@@ -18,6 +18,14 @@ export interface TextBlock {
   /** sampled from the rendered page, 0..1 */
   color: [number, number, number];
   background: [number, number, number];
+  /** true if the text was recognized in an image (it can only be covered, not removed) */
+  ocr?: boolean;
+  /** share of the box covered by its most common color (1 = flat background, low = photo) */
+  backgroundShare?: number;
+  /** alignment of the lines in the original */
+  align?: "left" | "center" | "right";
+  /** widest line of the original and its width (pt), to match the replacement font's width */
+  widest?: { text: string; width: number };
   /** style of the original font (digital text only) */
   bold?: boolean;
   serif?: boolean;
@@ -30,6 +38,8 @@ export interface PageText {
   skipped: number;
   /** true if the blocks come from OCR (scanned page) */
   ocr: boolean;
+  /** areas covered by images (user space): translated text must not grow into them */
+  images?: Rect[];
 }
 
 export type OcrMode = "auto" | "always" | "off";
@@ -58,7 +68,7 @@ type Rgb = [number, number, number];
 function sampleColors(
   ctx: CanvasRenderingContext2D,
   box: { left: number; top: number; width: number; height: number },
-): { color: Rgb; background: Rgb } {
+): { color: Rgb; background: Rgb; backgroundShare: number } {
   const left = Math.max(0, Math.floor(box.left));
   const top = Math.max(0, Math.floor(box.top));
   const w = Math.max(1, Math.min(ctx.canvas.width - left, Math.ceil(box.width)));
@@ -92,7 +102,7 @@ function sampleColors(
       best = c;
     }
   }
-  return { color: best, background };
+  return { color: best, background, backgroundShare: buckets[0].n / (w * h) };
 }
 
 type PdfPage = Awaited<ReturnType<PDFDocumentProxy["getPage"]>>;
@@ -331,7 +341,7 @@ function ocrBlocks(ocrLines: OcrLine[], viewport: Viewport, ctx: CanvasRendering
   return buildBlocks(lines).map((g) => {
     // OCR sizes vary a little from line to line; use the block's median
     const sizes = g.lines.map((l) => l.size).sort((a, b) => a - b);
-    return toBlock(g, sizes[Math.floor(sizes.length / 2)], viewport, ctx);
+    return { ...toBlock(g, sizes[Math.floor(sizes.length / 2)], viewport, ctx), ocr: true };
   });
 }
 
@@ -349,7 +359,33 @@ function toBlock(g: ReturnType<typeof buildBlocks>[number], fontSize: number, vi
     width: Math.abs(x2 - x1),
     height: Math.abs(y2 - y1),
   });
-  return { ...box, fontSize, text: groupText(g.lines), lineCount: g.lines.length, ...colors };
+  const view = viewport.viewBox as number[];
+  const align = alignment(g.lines, g.x, g.right, view[0], view[2]);
+  const widestLine = g.lines.reduce((a, l) => (l.right - l.x > a.right - a.x ? l : a), g.lines[0]);
+  return {
+    ...box,
+    fontSize,
+    // centered headings keep their line breaks
+    text: align === "center" && g.lines.length > 1 ? g.lines.map((l) => l.text.trim()).join("\n") : groupText(g.lines),
+    lineCount: g.lines.length,
+    ...colors,
+    align,
+    widest: { text: widestLine.text.trim(), width: widestLine.right - widestLine.x },
+  };
+}
+
+/** Left, centered or right aligned: from the lines of a block, or for one line from its position on the page. */
+function alignment(lines: Line[], x: number, right: number, pageLeft: number, pageRight: number): "left" | "center" | "right" {
+  const tol = Math.max(3, lines[0].size * 0.5);
+  const mid = (x + right) / 2;
+  if (lines.length > 1) {
+    const left = lines.every((l) => Math.abs(l.x - x) < tol);
+    if (!left && lines.every((l) => Math.abs((l.x + l.right) / 2 - mid) < tol)) return "center";
+    if (!left && lines.every((l) => Math.abs(l.right - right) < tol)) return "right";
+    return "left";
+  }
+  const width = pageRight - pageLeft;
+  return Math.abs(mid - (pageLeft + pageRight) / 2) < width * 0.02 && x - pageLeft > width * 0.12 ? "center" : "left";
 }
 
 /**
@@ -369,8 +405,8 @@ async function textPage(page: PdfPage, index: number, content: TextContent, ocr?
     const size = item.transform[3];
     runs.push({ x: item.transform[4], y: item.transform[5], right: item.transform[4] + item.width, size, str: item.str, font: item.fontName });
   }
-  const images = ocr ? await imageRects(page) : [];
-  const { viewport, canvas, ctx } = await renderUnrotated(page, images.length ? OCR_SCALE : 1.5);
+  const images = await imageRects(page);
+  const { viewport, canvas, ctx } = await renderUnrotated(page, ocr && images.length ? OCR_SCALE : 1.5);
   const style = fontStyles(page, content);
   const blocks: TextBlock[] = buildBlocks(buildLines(runs)).map((g) => {
     // the style most of the block's characters are set in
@@ -388,15 +424,23 @@ async function textPage(page: PdfPage, index: number, content: TextContent, ocr?
       const left = Math.max(0, Math.floor(Math.min(ax, bx)));
       const top = Math.max(0, Math.floor(Math.min(ay, by)));
       const region = { left, top, width: Math.min(canvas.width - left, Math.ceil(Math.abs(bx - ax))), height: Math.min(canvas.height - top, Math.ceil(Math.abs(by - ay))) };
-      const found = await recognizeRegion(worker, canvas, region, "strict");
+      // lines that are already in the text layer (text printed over a background image) are dropped
+      // line by line: a paragraph-level check misses OCR blocks that span several text paragraphs
+      const found = (await recognizeRegion(worker, canvas, region, "strict")).filter((l) => {
+        const [x0, y0] = viewport.convertToPdfPoint(l.x0, l.y1);
+        const [x1, y1] = viewport.convertToPdfPoint(l.x1, l.y0);
+        const r = { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.abs(x1 - x0), height: Math.abs(y1 - y0) };
+        return blocks.reduce((sum, v) => sum + overlap(v, r), 0) < 0.3 * r.width * r.height;
+      });
       for (const b of ocrBlocks(found, viewport, ctx)) {
         // text drawn on top of the image is already in the text layer
-        if (!blocks.some((v) => overlap(v, b) > 0.3 * b.width * b.height)) blocks.push(b);
+        // On photos a replaced patch looks worse than the original text: only flat backgrounds
+        if (!blocks.some((v) => overlap(v, b) > 0.3 * b.width * b.height) && (b.backgroundShare ?? 1) >= 0.5) blocks.push(b);
       }
     }
   }
   canvas.width = canvas.height = 0;
-  return { index, blocks: blocks.filter((b) => /[\p{L}]/u.test(b.text)), skipped, ocr: false };
+  return { index, blocks: blocks.filter((b) => /[\p{L}]/u.test(b.text)), skipped, ocr: false, images };
 }
 
 /**

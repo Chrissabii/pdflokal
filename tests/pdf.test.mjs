@@ -93,6 +93,9 @@ test("translated text keeps bold/serif style of the original", async () => {
   const fonts = { regular: font("DejaVuSans"), bold: font("DejaVuSans-Bold"), serif: font("DejaVuSerif"), serifBold: font("DejaVuSerif-Bold") };
   const block = (text, style) => ({ x: 70, y: 600, width: 300, height: 30, fontSize: 20, text, lineCount: 1, color: [0, 0, 0], background: [1, 1, 1], ...style });
   const pagesIn = [{ index: 0, skipped: 0, ocr: false, blocks: [block("Titel", { serif: true, bold: true }), { ...block("Text", {}), y: 500 }] }];
+  assert.ok(W.nearlyEqual("FUNKYBATTERCREAMTM Batch", "FUNKYBATTERCREAM™ Batch"));
+  assert.equal(W.nearlyEqual("Die Rezepte", "Le ricette"), false);
+  assert.equal(W.restoreSymbols("FUNKYBATTERCREAMTM Leitfaden", "FUNKYBATTERCREAM™ Guide"), "FUNKYBATTERCREAM™ Leitfaden");
   const out = await PDFDocument.load(await W.writeTranslatedPdf(A, pagesIn, [["Überschrift", "Fließtext"]], "layout", fonts));
   const names = out.context.enumerateIndirectObjects().map(([, o]) => String(o.get?.(out.context.obj("BaseFont")) ?? "")).filter(Boolean);
   assert.ok(names.some((n) => n.includes("DejaVuSerif-Bold")), names.join());
@@ -105,6 +108,40 @@ test("image pieces of one headline are merged into one OCR area", async () => {
     { x: 100, y: 700, width: 154, height: 30 },
     { x: 60, y: 200, width: 400, height: 300 },
   ]);
+});
+
+test("original text is removed from the page instead of covered (page and form XObject)", async () => {
+  const { removeTextInBoxes } = await import("../src/lib/pdf/translate/strip.ts");
+  const fontkit = (await import("@pdf-lib/fontkit")).default;
+  const { readFileSync } = await import("node:fs");
+  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // inner page → becomes a form XObject (how Canva stores its text)
+  const src = await PDFDocument.create();
+  src.registerFontkit(fontkit);
+  const dejavu = await src.embedFont(readFileSync(new URL("../node_modules/dejavu-fonts-ttf/ttf/DejaVuSans.ttf", import.meta.url)));
+  const helv = await src.embedFont(StandardFonts.Helvetica);
+  const inner = src.addPage([595, 842]);
+  inner.drawText("Pasta frolla", { x: 70, y: 600, size: 20, font: dejavu });
+  const outer = await PDFDocument.create();
+  const page = outer.addPage([595, 842]);
+  page.drawRectangle({ x: 0, y: 0, width: 595, height: 842, color: rgb(0.9, 0.6, 0.2) });
+  page.drawPage(await outer.embedPage((await PDFDocument.load(await (async () => { inner.drawText("Ciao mondo", { x: 70, y: 700, size: 20, font: helv }); return src.save(); })())).getPage(0)));
+  page.drawText("Tienimi", { x: 70, y: 500, size: 20, font: await outer.embedFont(StandardFonts.Helvetica) });
+  const doc = await PDFDocument.load(await outer.save());
+  const removed = removeTextInBoxes(doc, doc.getPage(0), [
+    { x: 65, y: 693, width: 200, height: 26 },
+    { x: 65, y: 593, width: 200, height: 26 },
+  ]);
+  assert.ok(removed[0] >= 10 && removed[1] >= 12, String(removed));
+  doc.getPage(0).drawText("Hallo Welt", { x: 70, y: 700, size: 20, font: await doc.embedFont(StandardFonts.Helvetica) });
+  const pdf = await getDocument({ data: await doc.save(), verbosity: 0 }).promise;
+  const p = await pdf.getPage(1);
+  const text = (await p.getTextContent()).items.map((i) => i.str).join("|");
+  assert.equal(text.includes("Ciao") || text.includes("Pasta"), false, text);
+  assert.ok(text.includes("Hallo Welt"), text);
+  assert.ok(text.includes("Tienimi"), text);
+  const ops = await p.getOperatorList();
+  assert.ok(ops.fnArray.length > 5, "background drawing kept");
 });
 
 test("language detection and translation routes", () => {
